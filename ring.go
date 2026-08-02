@@ -96,3 +96,20 @@ func (r *Ring) GetNode(key string) (string, bool) {
 	}
 	return r.nodeAt[r.positions[idx]], true
 }
+
+// Clone returns a deep copy of the ring — used for copy-on-write topology
+// updates, so the old ring stays immutable for concurrent readers.
+func (r *Ring) Clone() *Ring {
+	positions := make([]uint32, len(r.positions))
+	copy(positions, r.positions)
+
+	nodeAt := make(map[uint32]string, len(r.nodeAt))
+	for k, v := range r.nodeAt {
+		nodeAt[k] = v
+	}
+	nodes := make(map[string]struct{}, len(r.nodes))
+	for k := range r.nodes {
+		nodes[k] = struct{}{}
+	}
+	return &Ring{vnodes: r.vnodes, positions: positions, nodeAt: nodeAt, nodes: nodes}
+}
