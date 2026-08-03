@@ -31,7 +31,7 @@ func TestCacheSpreadsAcrossShards(t *testing.T) {
 	}
 	// every shard should hold some keys (keys spread across shards)
 	nonEmpty := 0
-	for _, s := range c.shards {
+	for _, s := range c.topo.Load().shards {
 		if s.Len() > 0 {
 			nonEmpty++
 		}
@@ -68,56 +68,62 @@ func TestCacheConcurrent(t *testing.T) {
 	wg.Wait()
 }
 
-func TestAddNodeMigratesKeys(t *testing.T) {
+// With the atomic COW ring swap we use drop-and-rewarm (no migration):
+// keys that change owner on a topology change miss and refetch.
+func TestAddNodeDropAndRewarm(t *testing.T) {
 	c := NewCache(4, 1000000, 128) // big capacity — no eviction
 	const n = 5000
 	for i := 0; i < n; i++ {
-		c.Put(fmt.Sprintf("key-%d", i), []byte(fmt.Sprintf("v%d", i)), 0)
-	}
-	if c.Len() != n {
-		t.Fatalf("Len before = %d, want %d", c.Len(), n)
+		c.Put(fmt.Sprintf("key-%d", i), []byte("v"), 0)
 	}
 
 	c.AddNode("shard-new")
 
-	// every key must still be retrievable — nothing lost in migration
+	if _, ok := c.topo.Load().shards["shard-new"]; !ok {
+		t.Fatal("new shard not in topology")
+	}
+	hits := 0
 	for i := 0; i < n; i++ {
-		key := fmt.Sprintf("key-%d", i)
-		got, ok := c.Get(key)
-		if !ok || string(got) != fmt.Sprintf("v%d", i) {
-			t.Fatalf("after AddNode, key %s lost: got %q ok=%v", key, got, ok)
+		if _, ok := c.Get(fmt.Sprintf("key-%d", i)); ok {
+			hits++
 		}
 	}
-	if c.Len() != n {
-		t.Errorf("Len after AddNode = %d, want %d (no keys lost)", c.Len(), n)
+	if hits >= n {
+		t.Error("expected SOME keys to miss (drop-and-rewarm), but all still hit")
 	}
-	if c.shards["shard-new"].Len() == 0 {
-		t.Error("new shard received no keys — migration didn't move anything")
+	if hits < n/2 {
+		t.Errorf("expected MOST keys to still hit (~1/N moved), got only %d/%d", hits, n)
+	}
+	c.Put("key-0", []byte("rewarmed"), 0) // cache still works
+	if got, ok := c.Get("key-0"); !ok || string(got) != "rewarmed" {
+		t.Fatalf("re-put after AddNode failed: got %q ok=%v", got, ok)
 	}
 }
 
-func TestRemoveNodeMigratesKeys(t *testing.T) {
+func TestRemoveNodeDropAndRewarm(t *testing.T) {
 	c := NewCache(4, 1000000, 128)
 	const n = 5000
 	for i := 0; i < n; i++ {
-		c.Put(fmt.Sprintf("key-%d", i), []byte(fmt.Sprintf("v%d", i)), 0)
+		c.Put(fmt.Sprintf("key-%d", i), []byte("v"), 0)
 	}
 
 	c.RemoveNode("shard-0")
 
-	if _, exists := c.shards["shard-0"]; exists {
-		t.Fatal("shard-0 should be removed from the map")
+	if _, ok := c.topo.Load().shards["shard-0"]; ok {
+		t.Fatal("shard-0 should be gone from topology")
 	}
-	// every key must still be retrievable — redistributed to other shards
+	hits := 0
 	for i := 0; i < n; i++ {
-		key := fmt.Sprintf("key-%d", i)
-		got, ok := c.Get(key)
-		if !ok || string(got) != fmt.Sprintf("v%d", i) {
-			t.Fatalf("after RemoveNode, key %s lost: got %q ok=%v", key, got, ok)
+		if _, ok := c.Get(fmt.Sprintf("key-%d", i)); ok {
+			hits++
 		}
 	}
-	if c.Len() != n {
-		t.Errorf("Len after RemoveNode = %d, want %d (no keys lost)", c.Len(), n)
+	if hits >= n {
+		t.Error("expected shard-0's keys to be dropped (miss), but all still hit")
+	}
+	c.Put("key-0", []byte("rewarmed"), 0) // cache still works
+	if got, ok := c.Get("key-0"); !ok || string(got) != "rewarmed" {
+		t.Fatalf("re-put after RemoveNode failed: got %q ok=%v", got, ok)
 	}
 }
 

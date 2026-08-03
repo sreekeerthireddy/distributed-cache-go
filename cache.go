@@ -3,76 +3,71 @@ package distcache
 import (
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
-// Cache is the facade: it holds the routing Ring plus a set of Shards
-// (nodeID -> *Shard) and dispatches each operation to the owning shard.
-//
-// The RWMutex protects the TOPOLOGY (ring + shards map), NOT shard data
-// (each shard has its own lock). Get/Put/Delete only READ the topology, so
-// they take RLock and run concurrently; AddNode/RemoveNode MUTATE it, so
-// they take the exclusive Lock.
+// topology is an IMMUTABLE snapshot of routing state (ring + shard map). It is
+// never mutated after publication — AddNode/RemoveNode build a NEW topology and
+// swap the pointer atomically. This makes Get/Put/Delete lock-free.
+type topology struct {
+	ring   *Ring
+	shards map[string]*Shard
+}
+
+func (t *topology) shardFor(key string) *Shard {
+	id, ok := t.ring.GetNode(key)
+	if !ok {
+		return nil
+	}
+	return t.shards[id]
+}
+
+// Cache holds the current topology in an atomic.Pointer so reads route
+// lock-free; writers (AddNode/RemoveNode) serialize on writeMu and swap in a
+// new topology (copy-on-write).
 type Cache struct {
-	mu       sync.RWMutex
-	ring     *Ring
-	shards   map[string]*Shard
-	capacity int // per-shard capacity (used when adding shards)
+	topo     atomic.Pointer[topology]
+	writeMu  sync.Mutex // serializes AddNode/RemoveNode (writers only)
+	capacity int
 }
 
 // NewCache builds a cache with numShards shards, each holding up to
 // shardCapacity entries, using `vnodes` virtual nodes per shard on the ring.
 func NewCache(numShards, shardCapacity, vnodes int) *Cache {
-	c := &Cache{
-		ring:     NewRing(vnodes),
-		shards:   make(map[string]*Shard, numShards),
-		capacity: shardCapacity,
-	}
+	ring := NewRing(vnodes)
+	shards := make(map[string]*Shard, numShards)
 	for i := 0; i < numShards; i++ {
 		id := "shard-" + strconv.Itoa(i)
-		c.shards[id] = NewShard(shardCapacity)
-		c.ring.AddNode(id)
+		shards[id] = NewShard(shardCapacity)
+		ring.AddNode(id)
 	}
+	c := &Cache{capacity: shardCapacity}
+	c.topo.Store(&topology{ring: ring, shards: shards})
 	return c
 }
 
-// shardFor returns the shard that owns key (or nil if the ring is empty).
-// Caller must hold at least c.mu.RLock (reads the ring + shards map).
-func (c *Cache) shardFor(key string) *Shard {
-	nodeID, ok := c.ring.GetNode(key)
-	if !ok {
-		return nil
-	}
-	return c.shards[nodeID]
-}
-
-// Get routes to the owning shard.
+// Get routes to the owning shard (lock-free topology load).
 func (c *Cache) Get(key string) ([]byte, bool) {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-	s := c.shardFor(key)
+	s := c.topo.Load().shardFor(key)
 	if s == nil {
 		return nil, false
 	}
 	return s.Get(key)
 }
 
-// Put routes to the owning shard.
+// Put routes to the owning shard (lock-free topology load).
 func (c *Cache) Put(key string, value []byte, ttl time.Duration) {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-	s := c.shardFor(key)
+	s := c.topo.Load().shardFor(key)
 	if s == nil {
 		return
 	}
 	s.Put(key, value, ttl)
 }
 
-// Delete routes to the owning shard.
+// Delete routes to the owning shard (lock-free topology load).
 func (c *Cache) Delete(key string) bool {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-	s := c.shardFor(key)
+	s := c.topo.Load().shardFor(key)
 	if s == nil {
 		return false
 	}
@@ -81,63 +76,56 @@ func (c *Cache) Delete(key string) bool {
 
 // Len returns the total number of entries across all shards.
 func (c *Cache) Len() int {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
+	t := c.topo.Load()
 	total := 0
-	for _, s := range c.shards {
+	for _, s := range t.shards {
 		total += s.Len()
 	}
 	return total
 }
 
-// AddNode adds a new shard and migrates the keys that now belong to it.
-// Stop-the-world: holds the exclusive lock for the whole migration, so it's
-// atomic w.r.t. all other operations. No-op if the node already exists.
+// AddNode adds a shard via copy-on-write, then atomically swaps the topology.
+// Drop-and-rewarm: no data migration — keys that now route to the new shard
+// miss and refetch. No-op if the node already exists.
 func (c *Cache) AddNode(id string) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
 
-	if _, exists := c.shards[id]; exists {
+	old := c.topo.Load()
+	if _, exists := old.shards[id]; exists {
 		return
 	}
-	newShard := NewShard(c.capacity)
-	c.shards[id] = newShard
-	c.ring.AddNode(id)
+	newRing := old.ring.Clone()
+	newRing.AddNode(id)
 
-	// Any key whose owner is now `id` moves from its old shard to the new one.
-	// (Consistent hashing => adding a node only moves keys TO it.)
-	for sid, s := range c.shards {
-		if sid == id {
-			continue
-		}
-		for _, e := range s.snapshot() {
-			if owner, _ := c.ring.GetNode(e.key); owner == id {
-				newShard.putEntry(e.key, e.value, e.expiresAt) // preserves TTL
-				s.Delete(e.key)
-			}
-		}
+	newShards := make(map[string]*Shard, len(old.shards)+1)
+	for k, v := range old.shards {
+		newShards[k] = v
 	}
+	newShards[id] = NewShard(c.capacity)
+
+	c.topo.Store(&topology{ring: newRing, shards: newShards})
 }
 
-// RemoveNode removes a shard and redistributes its keys to their new owners.
-// Stop-the-world: atomic under the exclusive lock. No-op if not present.
+// RemoveNode removes a shard via copy-on-write. Drop-and-rewarm: the removed
+// shard's keys are dropped (reroute to other shards -> miss -> refetch).
+// No-op if not present.
 func (c *Cache) RemoveNode(id string) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
 
-	removed, exists := c.shards[id]
-	if !exists {
+	old := c.topo.Load()
+	if _, exists := old.shards[id]; !exists {
 		return
 	}
-	entries := removed.snapshot() // capture BEFORE we change the ring
-	c.ring.RemoveNode(id)         // now GetNode returns the NEW owners
-	delete(c.shards, id)
+	newRing := old.ring.Clone()
+	newRing.RemoveNode(id)
 
-	// Redistribute the removed shard's keys to their new owners.
-	for _, e := range entries {
-		if owner, ok := c.ring.GetNode(e.key); ok {
-			c.shards[owner].putEntry(e.key, e.value, e.expiresAt)
+	newShards := make(map[string]*Shard, len(old.shards)-1)
+	for k, v := range old.shards {
+		if k != id {
+			newShards[k] = v
 		}
-		// if !ok, the ring is now empty => entry is dropped
 	}
+	c.topo.Store(&topology{ring: newRing, shards: newShards})
 }
