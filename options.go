@@ -15,7 +15,8 @@ type cacheOptions struct {
 	promoteFrac   float64       // α: promote a key above promoteFrac·S_max
 	demoteFrac    float64       // hysteresis lower bar (< promoteFrac)
 	maxHot        int           // hot-set safety cap
-	replicas      int           // R for read replication (used in Phase 2)
+	replicas      int           // R for read replication
+	replicaTTL    time.Duration // TTL on hot-key replicas (bounds staleness after demotion)
 }
 
 func defaultOptions() cacheOptions {
@@ -30,6 +31,7 @@ func defaultOptions() cacheOptions {
 		demoteFrac:    0.075,     // ~195K ops/sec → stay sharded until below this
 		maxHot:        16,
 		replicas:      4,
+		replicaTTL:    10 * time.Second,
 	}
 }
 
@@ -44,5 +46,13 @@ func WithHotKeyThreshold(shardMaxRate, promoteFrac, demoteFrac float64) Option {
 	}
 }
 
-// WithReplicas sets R, the replication factor for hot read-keys (Phase 2).
+// WithReplicas sets R, the replication factor for hot read-keys.
 func WithReplicas(r int) Option { return func(o *cacheOptions) { o.replicas = r } }
+
+// WithReplicaTTL sets how long hot-key replicas live before needing a refresh.
+func WithReplicaTTL(d time.Duration) Option { return func(o *cacheOptions) { o.replicaTTL = d } }
+
+// WithDecayInterval sets how often the detector decays counts and republishes the
+// hot set. The promote/demote thresholds recalibrate to this interval, so shorter
+// intervals just react faster (useful for short-lived processes and benchmarks).
+func WithDecayInterval(d time.Duration) Option { return func(o *cacheOptions) { o.decayInterval = d } }

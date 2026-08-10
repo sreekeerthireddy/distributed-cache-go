@@ -28,6 +28,64 @@ func main() {
 
 	fmt.Println("\n=== ZIPFIAN keys (hot keys) — throughput scales LESS (hot shard) ===")
 	sweep(shardCounts, zipfianKeygen)
+
+	compareReplication()
+}
+
+// compareReplication measures the Phase-2 payoff: Zipfian throughput with hot-key
+// read replication OFF vs ON, at a fixed shard count. Runs long enough for the
+// detector to engage (fast decay interval on the ON case).
+func compareReplication() {
+	const shards = 16
+	const opsPerWorker = 500000 // several seconds — lets detection reach steady state
+
+	fastDecay := distcache.WithDecayInterval(200 * time.Millisecond)
+	for _, wl := range []struct {
+		name     string
+		writePct int
+		skew     float64
+	}{
+		{"90% read / 10% write, s=1.3", 10, 1.3},
+		{"99% read /  1% write, s=1.3", 1, 1.3},
+		{"99% read /  1% write, s=1.5", 1, 1.5},
+	} {
+		fmt.Printf("\n=== read-hot replication OFF vs ON (16 shards) — %s ===\n", wl.name)
+		off := runZipf(shards, opsPerWorker, wl.writePct, wl.skew, distcache.WithHotKeys(false))
+		on4 := runZipf(shards, opsPerWorker, wl.writePct, wl.skew, fastDecay, distcache.WithReplicas(4))
+		on8 := runZipf(shards, opsPerWorker, wl.writePct, wl.skew, fastDecay, distcache.WithReplicas(8))
+		fmt.Printf("%-28s %-18s\n", "config", "throughput(op/s)")
+		fmt.Printf("%-28s %-18.0f\n", "OFF", off)
+		fmt.Printf("%-28s %-18.0f (%.2fx)\n", "replication ON (R=4)", on4, on4/off)
+		fmt.Printf("%-28s %-18.0f (%.2fx)\n", "replication ON (R=8)", on8, on8/off)
+	}
+}
+
+func runZipf(numShards, opsPerWorker, writePct int, skew float64, opts ...distcache.Option) float64 {
+	c := distcache.NewCache(numShards, capacity, vnodes, opts...)
+	defer c.Close()
+	for i := 0; i < numKeys; i++ {
+		c.Put(fmt.Sprintf("key-%d", i), []byte("v"), 0)
+	}
+	var wg sync.WaitGroup
+	start := time.Now()
+	for w := 0; w < workers; w++ {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			r := rand.New(rand.NewSource(int64(id) + 1))
+			z := rand.NewZipf(r, skew, 1, uint64(numKeys-1))
+			for i := 0; i < opsPerWorker; i++ {
+				key := fmt.Sprintf("key-%d", z.Uint64())
+				if r.Intn(100) < writePct {
+					c.Put(key, []byte("v"), 0)
+				} else {
+					c.Get(key)
+				}
+			}
+		}(w)
+	}
+	wg.Wait()
+	return float64(workers*opsPerWorker) / time.Since(start).Seconds()
 }
 
 type keygenFactory func(*rand.Rand) func() string
@@ -54,6 +112,7 @@ func sweep(shardCounts []int, factory keygenFactory) {
 
 func runBench(numShards int, factory keygenFactory) float64 {
 	c := distcache.NewCache(numShards, capacity, vnodes)
+	defer c.Close()
 	for i := 0; i < numKeys; i++ { // warm up
 		c.Put(fmt.Sprintf("key-%d", i), []byte("v"), 0)
 	}

@@ -1,6 +1,7 @@
 package distcache
 
 import (
+	"math/rand/v2"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -29,9 +30,10 @@ func (t *topology) shardFor(key string) *Shard {
 type Cache struct {
 	topo     atomic.Pointer[topology]
 	writeMu  sync.Mutex // serializes AddNode/RemoveNode (writers only)
-	capacity int
-	detector *detector // nil when hot keys disabled
-	replicas int        // R (used in Phase 2)
+	capacity   int
+	detector   *detector // nil when hot keys disabled
+	replicas   int       // R: replicas per hot key
+	replicaTTL time.Duration
 }
 
 // NewCache builds a cache with numShards shards, each holding up to
@@ -51,7 +53,7 @@ func NewCache(numShards, shardCapacity, vnodes int, opts ...Option) *Cache {
 		shards[id] = NewShard(shardCapacity)
 		ring.AddNode(id)
 	}
-	c := &Cache{capacity: shardCapacity, replicas: o.replicas}
+	c := &Cache{capacity: shardCapacity, replicas: o.replicas, replicaTTL: o.replicaTTL}
 	c.topo.Store(&topology{ring: ring, shards: shards})
 
 	if o.hotKeys {
@@ -74,33 +76,47 @@ func (c *Cache) Close() {
 	}
 }
 
-// Get routes to the owning shard (lock-free topology load).
+// Get routes to the owning shard (lock-free topology load). Hot keys are served
+// from a random replica, falling back to the primary on a miss.
 func (c *Cache) Get(key string) ([]byte, bool) {
 	if c.detector != nil {
 		c.detector.record(key)
 	}
-	s := c.topo.Load().shardFor(key)
+	topo := c.topo.Load()
+	if c.replicate(key) {
+		return c.getReplicated(topo, key)
+	}
+	s := topo.shardFor(key)
 	if s == nil {
 		return nil, false
 	}
 	return s.Get(key)
 }
 
-// Put routes to the owning shard (lock-free topology load).
+// Put routes to the owning shard (lock-free topology load). Hot keys are written
+// to the primary plus all replicas.
 func (c *Cache) Put(key string, value []byte, ttl time.Duration) {
 	if c.detector != nil {
 		c.detector.record(key)
 	}
-	s := c.topo.Load().shardFor(key)
-	if s == nil {
+	topo := c.topo.Load()
+	if c.replicate(key) {
+		c.putReplicated(topo, key, value, ttl)
 		return
 	}
-	s.Put(key, value, ttl)
+	if s := topo.shardFor(key); s != nil {
+		s.Put(key, value, ttl)
+	}
 }
 
-// Delete routes to the owning shard (lock-free topology load).
+// Delete routes to the owning shard (lock-free topology load). Hot keys are
+// cleared from the primary and all replicas.
 func (c *Cache) Delete(key string) bool {
-	s := c.topo.Load().shardFor(key)
+	topo := c.topo.Load()
+	if c.replicate(key) {
+		return c.deleteReplicated(topo, key)
+	}
+	s := topo.shardFor(key)
 	if s == nil {
 		return false
 	}
@@ -115,6 +131,71 @@ func (c *Cache) Len() int {
 		total += s.Len()
 	}
 	return total
+}
+
+// replicaKey derives the i-th replica key for a hot key. The NUL separator makes
+// a collision with a real user key practically impossible.
+func replicaKey(key string, i int) string {
+	return key + "\x00" + strconv.Itoa(i)
+}
+
+// replicate reports whether key should be served from replicas right now.
+func (c *Cache) replicate(key string) bool {
+	return c.detector != nil && c.replicas > 1 && c.detector.isHot(key)
+}
+
+// getReplicated reads a hot key: try one random replica, fall back to the primary
+// (and backfill that replica) on a miss. All routing uses the passed-in snapshot.
+func (c *Cache) getReplicated(topo *topology, key string) ([]byte, bool) {
+	rk := replicaKey(key, rand.IntN(c.replicas))
+	rs := topo.shardFor(rk)
+	if rs != nil {
+		if v, ok := rs.Get(rk); ok {
+			return v, true // replica hit → the read landed on a spread-out shard
+		}
+	}
+	ps := topo.shardFor(key) // replica miss → primary is the source of truth
+	if ps == nil {
+		return nil, false
+	}
+	v, ok := ps.Get(key)
+	if ok && rs != nil {
+		rs.Put(rk, v, c.replicaTTL) // backfill so future reads hit the replica
+	}
+	return v, ok
+}
+
+// putReplicated writes the canonical primary plus all replicas (bounded TTL).
+func (c *Cache) putReplicated(topo *topology, key string, value []byte, ttl time.Duration) {
+	if ps := topo.shardFor(key); ps != nil {
+		ps.Put(key, value, ttl) // canonical copy keeps the caller's TTL
+	}
+	rttl := c.replicaTTL
+	if ttl > 0 && ttl < rttl {
+		rttl = ttl // never outlive the primary
+	}
+	for i := 0; i < c.replicas; i++ {
+		rk := replicaKey(key, i)
+		if rs := topo.shardFor(rk); rs != nil {
+			rs.Put(rk, value, rttl)
+		}
+	}
+}
+
+// deleteReplicated clears the primary and every replica. Returns whether the
+// primary existed.
+func (c *Cache) deleteReplicated(topo *topology, key string) bool {
+	ok := false
+	if ps := topo.shardFor(key); ps != nil {
+		ok = ps.Delete(key)
+	}
+	for i := 0; i < c.replicas; i++ {
+		rk := replicaKey(key, i)
+		if rs := topo.shardFor(rk); rs != nil {
+			rs.Delete(rk)
+		}
+	}
+	return ok
 }
 
 // AddNode adds a shard via copy-on-write, then atomically swaps the topology.
