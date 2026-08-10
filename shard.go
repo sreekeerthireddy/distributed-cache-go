@@ -2,6 +2,7 @@ package distcache
 
 import (
 	"container/list"
+	"strconv"
 	"sync"
 	"time"
 )
@@ -80,7 +81,11 @@ func (s *Shard) Put(key string, value []byte, ttl time.Duration) {
 func (s *Shard) putEntry(key string, value []byte, expiresAt time.Time) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.putEntryLocked(key, value, expiresAt)
+}
 
+// putEntryLocked is putEntry without locking; the caller must already hold s.mu.
+func (s *Shard) putEntryLocked(key string, value []byte, expiresAt time.Time) {
 	// Update path: key already present → refresh value + TTL, mark recent.
 	if elem, ok := s.store[key]; ok {
 		ent := elem.Value.(*entry)
@@ -99,6 +104,25 @@ func (s *Shard) putEntry(key string, value []byte, expiresAt time.Time) {
 	if s.ll.Len() > s.capacity {
 		s.evictLRU()
 	}
+}
+
+// Add atomically adds delta to the integer counter at key and returns the new
+// value. A missing or expired key starts from 0. The counter is stored as its
+// decimal string (so it reuses the LRU/TTL machinery) and never expires.
+// Safe for concurrent use.
+func (s *Shard) Add(key string, delta int64) int64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	var cur int64
+	if elem, ok := s.store[key]; ok {
+		if ent := elem.Value.(*entry); !ent.expired(time.Now()) {
+			cur, _ = strconv.ParseInt(string(ent.value), 10, 64)
+		}
+	}
+	cur += delta
+	s.putEntryLocked(key, []byte(strconv.FormatInt(cur, 10)), time.Time{})
+	return cur
 }
 
 // evictLRU removes the least-recently-used entry (the back of the list).

@@ -17,6 +17,7 @@ type cacheOptions struct {
 	maxHot        int           // hot-set safety cap
 	replicas      int           // R for read replication
 	replicaTTL    time.Duration // TTL on hot-key replicas (bounds staleness after demotion)
+	counterShards int           // sub-counters per sharded counter (Incr/GetCounter)
 }
 
 func defaultOptions() cacheOptions {
@@ -32,6 +33,7 @@ func defaultOptions() cacheOptions {
 		maxHot:        16,
 		replicas:      4,
 		replicaTTL:    10 * time.Second,
+		counterShards: 8,
 	}
 }
 
@@ -56,3 +58,6 @@ func WithReplicaTTL(d time.Duration) Option { return func(o *cacheOptions) { o.r
 // hot set. The promote/demote thresholds recalibrate to this interval, so shorter
 // intervals just react faster (useful for short-lived processes and benchmarks).
 func WithDecayInterval(d time.Duration) Option { return func(o *cacheOptions) { o.decayInterval = d } }
+
+// WithCounterShards sets how many sub-counters a sharded counter is split into.
+func WithCounterShards(n int) Option { return func(o *cacheOptions) { o.counterShards = n } }

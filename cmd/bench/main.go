@@ -58,6 +58,46 @@ func compareReplication() {
 		fmt.Printf("%-28s %-18.0f (%.2fx)\n", "replication ON (R=4)", on4, on4/off)
 		fmt.Printf("%-28s %-18.0f (%.2fx)\n", "replication ON (R=8)", on8, on8/off)
 	}
+
+	compareCounter()
+}
+
+// compareCounter measures the write-hot payoff: increments/sec on ONE logical
+// counter as it's split into more sub-counters (spreading the write across shard
+// locks). counterShards=1 is the naive single-counter baseline.
+func compareCounter() {
+	const shards = 16
+	const opsPerWorker = 500000
+
+	fmt.Println("\n=== write-hot sharded counter: increments/sec by #sub-counters (16 shards) ===")
+	fmt.Printf("%-16s %-18s\n", "sub-counters", "incr/s")
+	base := 0.0
+	for i, cs := range []int{1, 2, 4, 8, 16} {
+		tp := runIncr(shards, opsPerWorker, cs)
+		if i == 0 {
+			base = tp
+		}
+		fmt.Printf("%-16d %-18.0f (%.2fx)\n", cs, tp, tp/base)
+	}
+}
+
+func runIncr(numShards, opsPerWorker, counterShards int) float64 {
+	c := distcache.NewCache(numShards, capacity, vnodes,
+		distcache.WithHotKeys(false), distcache.WithCounterShards(counterShards))
+	defer c.Close()
+	var wg sync.WaitGroup
+	start := time.Now()
+	for w := 0; w < workers; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := 0; i < opsPerWorker; i++ {
+				c.Incr("likes", 1)
+			}
+		}()
+	}
+	wg.Wait()
+	return float64(workers*opsPerWorker) / time.Since(start).Seconds()
 }
 
 func runZipf(numShards, opsPerWorker, writePct int, skew float64, opts ...distcache.Option) float64 {

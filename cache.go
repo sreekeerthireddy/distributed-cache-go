@@ -30,10 +30,11 @@ func (t *topology) shardFor(key string) *Shard {
 type Cache struct {
 	topo     atomic.Pointer[topology]
 	writeMu  sync.Mutex // serializes AddNode/RemoveNode (writers only)
-	capacity   int
-	detector   *detector // nil when hot keys disabled
-	replicas   int       // R: replicas per hot key
-	replicaTTL time.Duration
+	capacity      int
+	detector      *detector // nil when hot keys disabled
+	replicas      int       // R: replicas per hot key
+	replicaTTL    time.Duration
+	counterShards int // sub-counters per sharded counter
 }
 
 // NewCache builds a cache with numShards shards, each holding up to
@@ -53,7 +54,8 @@ func NewCache(numShards, shardCapacity, vnodes int, opts ...Option) *Cache {
 		shards[id] = NewShard(shardCapacity)
 		ring.AddNode(id)
 	}
-	c := &Cache{capacity: shardCapacity, replicas: o.replicas, replicaTTL: o.replicaTTL}
+	c := &Cache{capacity: shardCapacity, replicas: o.replicas,
+		replicaTTL: o.replicaTTL, counterShards: o.counterShards}
 	c.topo.Store(&topology{ring: ring, shards: shards})
 
 	if o.hotKeys {
@@ -94,11 +96,9 @@ func (c *Cache) Get(key string) ([]byte, bool) {
 }
 
 // Put routes to the owning shard (lock-free topology load). Hot keys are written
-// to the primary plus all replicas.
+// to the primary plus all replicas. Writes do NOT feed the detector — "hot" means
+// read-hot, so replication targets read-heavy keys (write-hot keys use Incr).
 func (c *Cache) Put(key string, value []byte, ttl time.Duration) {
-	if c.detector != nil {
-		c.detector.record(key)
-	}
 	topo := c.topo.Load()
 	if c.replicate(key) {
 		c.putReplicated(topo, key, value, ttl)
@@ -196,6 +196,41 @@ func (c *Cache) deleteReplicated(topo *topology, key string) bool {
 		}
 	}
 	return ok
+}
+
+// counterKey derives the i-th sub-counter key. The NUL + "c" namespace avoids
+// collisions with real user keys and with replica keys.
+func counterKey(key string, i int) string {
+	return key + "\x00c" + strconv.Itoa(i)
+}
+
+// Incr adds delta to key's sharded counter by hitting a random sub-counter,
+// spreading write load across counterShards shards. A counter is split, never
+// replicated — so it bypasses the detector entirely. Use GetCounter for the total.
+func (c *Cache) Incr(key string, delta int64) {
+	topo := c.topo.Load()
+	ck := counterKey(key, rand.IntN(c.counterShards))
+	if s := topo.shardFor(ck); s != nil {
+		s.Add(ck, delta)
+	}
+}
+
+// GetCounter returns the logical total: the sum of all sub-counters. Reads touch
+// counterShards shards, which is fine because counter reads are far rarer than
+// increments (the whole reason to shard the writes).
+func (c *Cache) GetCounter(key string) int64 {
+	topo := c.topo.Load()
+	var total int64
+	for i := 0; i < c.counterShards; i++ {
+		ck := counterKey(key, i)
+		if s := topo.shardFor(ck); s != nil {
+			if v, ok := s.Get(ck); ok {
+				n, _ := strconv.ParseInt(string(v), 10, 64)
+				total += n
+			}
+		}
+	}
+	return total
 }
 
 // AddNode adds a shard via copy-on-write, then atomically swaps the topology.
