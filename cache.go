@@ -30,11 +30,20 @@ type Cache struct {
 	topo     atomic.Pointer[topology]
 	writeMu  sync.Mutex // serializes AddNode/RemoveNode (writers only)
 	capacity int
+	detector *detector // nil when hot keys disabled
+	replicas int        // R (used in Phase 2)
 }
 
 // NewCache builds a cache with numShards shards, each holding up to
 // shardCapacity entries, using `vnodes` virtual nodes per shard on the ring.
-func NewCache(numShards, shardCapacity, vnodes int) *Cache {
+// By default it also runs a hot-key detector (see options.go); disable with
+// WithHotKeys(false). Call Close when done to stop the detector's decay loop.
+func NewCache(numShards, shardCapacity, vnodes int, opts ...Option) *Cache {
+	o := defaultOptions()
+	for _, opt := range opts {
+		opt(&o)
+	}
+
 	ring := NewRing(vnodes)
 	shards := make(map[string]*Shard, numShards)
 	for i := 0; i < numShards; i++ {
@@ -42,13 +51,34 @@ func NewCache(numShards, shardCapacity, vnodes int) *Cache {
 		shards[id] = NewShard(shardCapacity)
 		ring.AddNode(id)
 	}
-	c := &Cache{capacity: shardCapacity}
+	c := &Cache{capacity: shardCapacity, replicas: o.replicas}
 	c.topo.Store(&topology{ring: ring, shards: shards})
+
+	if o.hotKeys {
+		promote := rateToCount(o.promoteFrac*o.shardMaxRate, o.decayInterval, o.decayFactor, o.sampleRate)
+		demote := rateToCount(o.demoteFrac*o.shardMaxRate, o.decayInterval, o.decayFactor, o.sampleRate)
+		c.detector = newDetector(detectorConfig{
+			capacity: o.ssCapacity, sampleRate: o.sampleRate, interval: o.decayInterval,
+			decayFactor: o.decayFactor, promote: promote, demote: demote, maxHot: o.maxHot,
+		})
+		c.detector.start()
+	}
 	return c
+}
+
+// Close releases background resources (the hot-key detector's decay loop).
+// Call exactly once; the cache must not be used afterward.
+func (c *Cache) Close() {
+	if c.detector != nil {
+		c.detector.Close()
+	}
 }
 
 // Get routes to the owning shard (lock-free topology load).
 func (c *Cache) Get(key string) ([]byte, bool) {
+	if c.detector != nil {
+		c.detector.record(key)
+	}
 	s := c.topo.Load().shardFor(key)
 	if s == nil {
 		return nil, false
@@ -58,6 +88,9 @@ func (c *Cache) Get(key string) ([]byte, bool) {
 
 // Put routes to the owning shard (lock-free topology load).
 func (c *Cache) Put(key string, value []byte, ttl time.Duration) {
+	if c.detector != nil {
+		c.detector.record(key)
+	}
 	s := c.topo.Load().shardFor(key)
 	if s == nil {
 		return
