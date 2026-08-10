@@ -123,6 +123,17 @@ func (c *Cache) Delete(key string) bool {
 	return s.Delete(key)
 }
 
+// ShardStats returns a per-shard activity snapshot keyed by shard ID. Useful for
+// spotting a hot shard — a skewed op distribution across shards.
+func (c *Cache) ShardStats() map[string]ShardStat {
+	t := c.topo.Load()
+	out := make(map[string]ShardStat, len(t.shards))
+	for id, s := range t.shards {
+		out[id] = s.stat()
+	}
+	return out
+}
+
 // Len returns the total number of entries across all shards.
 func (c *Cache) Len() int {
 	t := c.topo.Load()

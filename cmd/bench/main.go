@@ -60,6 +60,57 @@ func compareReplication() {
 	}
 
 	compareCounter()
+	compareHotShardLoad()
+}
+
+// compareHotShardLoad shows replication's real effect: the hottest shard's share
+// of total ops drops as the hot key's reads spread across replicas.
+func compareHotShardLoad() {
+	const shards = 16
+	const opsPerWorker = 500000
+
+	fmt.Println("\n=== hot-shard load: hottest shard's share of ops (Zipfian 99/1 s=1.5, 16 shards) ===")
+	fmt.Printf("(ideal share with 16 shards = %.1f%%)\n", 100.0/16)
+	off := hotShardShare(shards, opsPerWorker, distcache.WithHotKeys(false))
+	on := hotShardShare(shards, opsPerWorker,
+		distcache.WithDecayInterval(200*time.Millisecond), distcache.WithReplicas(8))
+	fmt.Printf("%-24s %.1f%%\n", "replication OFF", off*100)
+	fmt.Printf("%-24s %.1f%%\n", "replication ON (R=8)", on*100)
+}
+
+func hotShardShare(numShards, opsPerWorker int, opts ...distcache.Option) float64 {
+	c := distcache.NewCache(numShards, capacity, vnodes, opts...)
+	defer c.Close()
+	for i := 0; i < numKeys; i++ {
+		c.Put(fmt.Sprintf("key-%d", i), []byte("v"), 0)
+	}
+	var wg sync.WaitGroup
+	for w := 0; w < workers; w++ {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			r := rand.New(rand.NewSource(int64(id) + 1))
+			z := rand.NewZipf(r, 1.5, 1, uint64(numKeys-1))
+			for i := 0; i < opsPerWorker; i++ {
+				key := fmt.Sprintf("key-%d", z.Uint64())
+				if r.Intn(100) < 1 {
+					c.Put(key, []byte("v"), 0)
+				} else {
+					c.Get(key)
+				}
+			}
+		}(w)
+	}
+	wg.Wait()
+
+	var total, maxOps uint64
+	for _, s := range c.ShardStats() {
+		total += s.Ops()
+		if s.Ops() > maxOps {
+			maxOps = s.Ops()
+		}
+	}
+	return float64(maxOps) / float64(total)
 }
 
 // compareCounter measures the write-hot payoff: increments/sec on ONE logical
