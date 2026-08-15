@@ -8,6 +8,7 @@ import (
 
 func TestCacheBasic(t *testing.T) {
 	c := NewCache(4, 100, 128)
+	defer c.Close()
 	c.Put("a", []byte("1"), 0)
 	if got, ok := c.Get("a"); !ok || string(got) != "1" {
 		t.Fatalf("Get(a) = %q ok=%v, want 1", got, ok)
@@ -26,6 +27,7 @@ func TestCacheBasic(t *testing.T) {
 func TestCacheSpreadsAcrossShards(t *testing.T) {
 	const numShards = 8
 	c := NewCache(numShards, 100000, 128) // big capacity so nothing evicts
+	defer c.Close()
 	for i := 0; i < 10000; i++ {
 		c.Put(fmt.Sprintf("key-%d", i), []byte("v"), 0)
 	}
@@ -46,6 +48,7 @@ func TestCacheSpreadsAcrossShards(t *testing.T) {
 
 func TestCacheConcurrent(t *testing.T) {
 	c := NewCache(8, 1000, 128)
+	defer c.Close()
 	const goroutines, iters = 50, 2000
 	var wg sync.WaitGroup
 	for g := 0; g < goroutines; g++ {
@@ -72,6 +75,7 @@ func TestCacheConcurrent(t *testing.T) {
 // keys that change owner on a topology change miss and refetch.
 func TestAddNodeDropAndRewarm(t *testing.T) {
 	c := NewCache(4, 1000000, 128) // big capacity — no eviction
+	defer c.Close()
 	const n = 5000
 	for i := 0; i < n; i++ {
 		c.Put(fmt.Sprintf("key-%d", i), []byte("v"), 0)
@@ -102,6 +106,7 @@ func TestAddNodeDropAndRewarm(t *testing.T) {
 
 func TestRemoveNodeDropAndRewarm(t *testing.T) {
 	c := NewCache(4, 1000000, 128)
+	defer c.Close()
 	const n = 5000
 	for i := 0; i < n; i++ {
 		c.Put(fmt.Sprintf("key-%d", i), []byte("v"), 0)
@@ -131,6 +136,7 @@ func TestRemoveNodeDropAndRewarm(t *testing.T) {
 // Run with -race to catch topology/data races (the cache RWMutex).
 func TestConcurrentWithTopologyChange(t *testing.T) {
 	c := NewCache(4, 10000, 128)
+	defer c.Close()
 	var wg sync.WaitGroup
 
 	for g := 0; g < 20; g++ {

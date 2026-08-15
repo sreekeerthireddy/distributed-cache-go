@@ -1,6 +1,7 @@
 package distcache
 
 import (
+	"math/rand/v2"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -29,12 +30,23 @@ func (t *topology) shardFor(key string) *Shard {
 type Cache struct {
 	topo     atomic.Pointer[topology]
 	writeMu  sync.Mutex // serializes AddNode/RemoveNode (writers only)
-	capacity int
+	capacity      int
+	detector      *detector // nil when hot keys disabled
+	replicas      int       // R: replicas per hot key
+	replicaTTL    time.Duration
+	counterShards int // sub-counters per sharded counter
 }
 
 // NewCache builds a cache with numShards shards, each holding up to
 // shardCapacity entries, using `vnodes` virtual nodes per shard on the ring.
-func NewCache(numShards, shardCapacity, vnodes int) *Cache {
+// By default it also runs a hot-key detector (see options.go); disable with
+// WithHotKeys(false). Call Close when done to stop the detector's decay loop.
+func NewCache(numShards, shardCapacity, vnodes int, opts ...Option) *Cache {
+	o := defaultOptions()
+	for _, opt := range opts {
+		opt(&o)
+	}
+
 	ring := NewRing(vnodes)
 	shards := make(map[string]*Shard, numShards)
 	for i := 0; i < numShards; i++ {
@@ -42,36 +54,84 @@ func NewCache(numShards, shardCapacity, vnodes int) *Cache {
 		shards[id] = NewShard(shardCapacity)
 		ring.AddNode(id)
 	}
-	c := &Cache{capacity: shardCapacity}
+	c := &Cache{capacity: shardCapacity, replicas: o.replicas,
+		replicaTTL: o.replicaTTL, counterShards: o.counterShards}
 	c.topo.Store(&topology{ring: ring, shards: shards})
+
+	if o.hotKeys {
+		promote := rateToCount(o.promoteFrac*o.shardMaxRate, o.decayInterval, o.decayFactor, o.sampleRate)
+		demote := rateToCount(o.demoteFrac*o.shardMaxRate, o.decayInterval, o.decayFactor, o.sampleRate)
+		c.detector = newDetector(detectorConfig{
+			capacity: o.ssCapacity, sampleRate: o.sampleRate, interval: o.decayInterval,
+			decayFactor: o.decayFactor, promote: promote, demote: demote, maxHot: o.maxHot,
+		})
+		c.detector.start()
+	}
 	return c
 }
 
-// Get routes to the owning shard (lock-free topology load).
+// Close releases background resources (the hot-key detector's decay loop).
+// Call exactly once; the cache must not be used afterward.
+func (c *Cache) Close() {
+	if c.detector != nil {
+		c.detector.Close()
+	}
+}
+
+// Get routes to the owning shard (lock-free topology load). Hot keys are served
+// from a random replica, falling back to the primary on a miss.
 func (c *Cache) Get(key string) ([]byte, bool) {
-	s := c.topo.Load().shardFor(key)
+	if c.detector != nil {
+		c.detector.record(key)
+	}
+	topo := c.topo.Load()
+	if c.replicate(key) {
+		return c.getReplicated(topo, key)
+	}
+	s := topo.shardFor(key)
 	if s == nil {
 		return nil, false
 	}
 	return s.Get(key)
 }
 
-// Put routes to the owning shard (lock-free topology load).
+// Put routes to the owning shard (lock-free topology load). Hot keys are written
+// to the primary plus all replicas. Writes do NOT feed the detector — "hot" means
+// read-hot, so replication targets read-heavy keys (write-hot keys use Incr).
 func (c *Cache) Put(key string, value []byte, ttl time.Duration) {
-	s := c.topo.Load().shardFor(key)
-	if s == nil {
+	topo := c.topo.Load()
+	if c.replicate(key) {
+		c.putReplicated(topo, key, value, ttl)
 		return
 	}
-	s.Put(key, value, ttl)
+	if s := topo.shardFor(key); s != nil {
+		s.Put(key, value, ttl)
+	}
 }
 
-// Delete routes to the owning shard (lock-free topology load).
+// Delete routes to the owning shard (lock-free topology load). Hot keys are
+// cleared from the primary and all replicas.
 func (c *Cache) Delete(key string) bool {
-	s := c.topo.Load().shardFor(key)
+	topo := c.topo.Load()
+	if c.replicate(key) {
+		return c.deleteReplicated(topo, key)
+	}
+	s := topo.shardFor(key)
 	if s == nil {
 		return false
 	}
 	return s.Delete(key)
+}
+
+// ShardStats returns a per-shard activity snapshot keyed by shard ID. Useful for
+// spotting a hot shard — a skewed op distribution across shards.
+func (c *Cache) ShardStats() map[string]ShardStat {
+	t := c.topo.Load()
+	out := make(map[string]ShardStat, len(t.shards))
+	for id, s := range t.shards {
+		out[id] = s.stat()
+	}
+	return out
 }
 
 // Len returns the total number of entries across all shards.
@@ -80,6 +140,106 @@ func (c *Cache) Len() int {
 	total := 0
 	for _, s := range t.shards {
 		total += s.Len()
+	}
+	return total
+}
+
+// replicaKey derives the i-th replica key for a hot key. The NUL separator makes
+// a collision with a real user key practically impossible.
+func replicaKey(key string, i int) string {
+	return key + "\x00" + strconv.Itoa(i)
+}
+
+// replicate reports whether key should be served from replicas right now.
+func (c *Cache) replicate(key string) bool {
+	return c.detector != nil && c.replicas > 1 && c.detector.isHot(key)
+}
+
+// getReplicated reads a hot key: try one random replica, fall back to the primary
+// (and backfill that replica) on a miss. All routing uses the passed-in snapshot.
+func (c *Cache) getReplicated(topo *topology, key string) ([]byte, bool) {
+	rk := replicaKey(key, rand.IntN(c.replicas))
+	rs := topo.shardFor(rk)
+	if rs != nil {
+		if v, ok := rs.Get(rk); ok {
+			return v, true // replica hit → the read landed on a spread-out shard
+		}
+	}
+	ps := topo.shardFor(key) // replica miss → primary is the source of truth
+	if ps == nil {
+		return nil, false
+	}
+	v, ok := ps.Get(key)
+	if ok && rs != nil {
+		rs.Put(rk, v, c.replicaTTL) // backfill so future reads hit the replica
+	}
+	return v, ok
+}
+
+// putReplicated writes the canonical primary plus all replicas (bounded TTL).
+func (c *Cache) putReplicated(topo *topology, key string, value []byte, ttl time.Duration) {
+	if ps := topo.shardFor(key); ps != nil {
+		ps.Put(key, value, ttl) // canonical copy keeps the caller's TTL
+	}
+	rttl := c.replicaTTL
+	if ttl > 0 && ttl < rttl {
+		rttl = ttl // never outlive the primary
+	}
+	for i := 0; i < c.replicas; i++ {
+		rk := replicaKey(key, i)
+		if rs := topo.shardFor(rk); rs != nil {
+			rs.Put(rk, value, rttl)
+		}
+	}
+}
+
+// deleteReplicated clears the primary and every replica. Returns whether the
+// primary existed.
+func (c *Cache) deleteReplicated(topo *topology, key string) bool {
+	ok := false
+	if ps := topo.shardFor(key); ps != nil {
+		ok = ps.Delete(key)
+	}
+	for i := 0; i < c.replicas; i++ {
+		rk := replicaKey(key, i)
+		if rs := topo.shardFor(rk); rs != nil {
+			rs.Delete(rk)
+		}
+	}
+	return ok
+}
+
+// counterKey derives the i-th sub-counter key. The NUL + "c" namespace avoids
+// collisions with real user keys and with replica keys.
+func counterKey(key string, i int) string {
+	return key + "\x00c" + strconv.Itoa(i)
+}
+
+// Incr adds delta to key's sharded counter by hitting a random sub-counter,
+// spreading write load across counterShards shards. A counter is split, never
+// replicated — so it bypasses the detector entirely. Use GetCounter for the total.
+func (c *Cache) Incr(key string, delta int64) {
+	topo := c.topo.Load()
+	ck := counterKey(key, rand.IntN(c.counterShards))
+	if s := topo.shardFor(ck); s != nil {
+		s.Add(ck, delta)
+	}
+}
+
+// GetCounter returns the logical total: the sum of all sub-counters. Reads touch
+// counterShards shards, which is fine because counter reads are far rarer than
+// increments (the whole reason to shard the writes).
+func (c *Cache) GetCounter(key string) int64 {
+	topo := c.topo.Load()
+	var total int64
+	for i := 0; i < c.counterShards; i++ {
+		ck := counterKey(key, i)
+		if s := topo.shardFor(ck); s != nil {
+			if v, ok := s.Get(ck); ok {
+				n, _ := strconv.ParseInt(string(v), 10, 64)
+				total += n
+			}
+		}
 	}
 	return total
 }

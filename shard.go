@@ -2,6 +2,7 @@ package distcache
 
 import (
 	"container/list"
+	"strconv"
 	"sync"
 	"time"
 )
@@ -29,6 +30,8 @@ type Shard struct {
 	store    map[string]*list.Element // key -> node in ll  (O(1) lookup)
 	ll       *list.List               // front = most-recently-used, back = LRU victim
 	capacity int                      // max number of entries this shard holds
+
+	hits, misses, writes uint64 // activity counters, maintained under mu
 }
 
 // NewShard creates an empty shard that holds up to `capacity` entries.
@@ -48,6 +51,7 @@ func (s *Shard) Get(key string) ([]byte, bool) {
 
 	elem, ok := s.store[key]
 	if !ok {
+		s.misses++
 		return nil, false // miss — key not present
 	}
 
@@ -57,10 +61,12 @@ func (s *Shard) Get(key string) ([]byte, bool) {
 		// from BOTH structures so it doesn't linger.
 		s.ll.Remove(elem)
 		delete(s.store, key)
+		s.misses++
 		return nil, false
 	}
 
 	s.ll.MoveToFront(elem) // hit → mark most-recently-used
+	s.hits++
 	return ent.value, true
 }
 
@@ -80,6 +86,12 @@ func (s *Shard) Put(key string, value []byte, ttl time.Duration) {
 func (s *Shard) putEntry(key string, value []byte, expiresAt time.Time) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.putEntryLocked(key, value, expiresAt)
+}
+
+// putEntryLocked is putEntry without locking; the caller must already hold s.mu.
+func (s *Shard) putEntryLocked(key string, value []byte, expiresAt time.Time) {
+	s.writes++
 
 	// Update path: key already present → refresh value + TTL, mark recent.
 	if elem, ok := s.store[key]; ok {
@@ -99,6 +111,25 @@ func (s *Shard) putEntry(key string, value []byte, expiresAt time.Time) {
 	if s.ll.Len() > s.capacity {
 		s.evictLRU()
 	}
+}
+
+// Add atomically adds delta to the integer counter at key and returns the new
+// value. A missing or expired key starts from 0. The counter is stored as its
+// decimal string (so it reuses the LRU/TTL machinery) and never expires.
+// Safe for concurrent use.
+func (s *Shard) Add(key string, delta int64) int64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	var cur int64
+	if elem, ok := s.store[key]; ok {
+		if ent := elem.Value.(*entry); !ent.expired(time.Now()) {
+			cur, _ = strconv.ParseInt(string(ent.value), 10, 64)
+		}
+	}
+	cur += delta
+	s.putEntryLocked(key, []byte(strconv.FormatInt(cur, 10)), time.Time{})
+	return cur
 }
 
 // evictLRU removes the least-recently-used entry (the back of the list).
@@ -133,6 +164,21 @@ func (s *Shard) Len() int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.ll.Len()
+}
+
+// ShardStat is a point-in-time snapshot of one shard's activity.
+type ShardStat struct {
+	Hits, Misses, Writes uint64
+}
+
+// Ops is the total operations this shard has served.
+func (s ShardStat) Ops() uint64 { return s.Hits + s.Misses + s.Writes }
+
+// stat returns a snapshot of the shard's activity counters.
+func (s *Shard) stat() ShardStat {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return ShardStat{Hits: s.hits, Misses: s.misses, Writes: s.writes}
 }
 
 // snapshot returns a copy of all NON-expired entries in the shard. Used by
